@@ -291,7 +291,6 @@ namespace ClosedXML.Excel
         private int CalculateMinRowHeight(int startColumn, int endColumn, IXLGraphicEngine engine, Dpi dpi)
         {
             var glyphs = new List<GlyphBox>();
-            XLStyle? cellStyle = null;
             var rowHeightPx = 0;
             foreach (var cell in Row(startColumn, endColumn).CellsUsed().Cast<XLCell>())
             {
@@ -301,67 +300,440 @@ namespace ClosedXML.Excel
                 if (cell.IsMerged())
                     continue;
 
-                // Reuse styles if possible to reduce memory consumption
-                if (cellStyle is null || cellStyle.Value != cell.StyleValue)
-                    cellStyle = (XLStyle)cell.Style;
-
-                cell.GetGlyphBoxes(engine, dpi, glyphs);
-                var cellHeightPx = (int)Math.Ceiling(GetContentHeight(cellStyle.Alignment.TextRotation, glyphs));
-
+                var cellHeightPx = (int)Math.Ceiling(GetContentHeight(cell));
                 rowHeightPx = Math.Max(cellHeightPx, rowHeightPx);
             }
 
             return rowHeightPx;
         }
 
-        private static double GetContentHeight(int textRotationDeg, List<GlyphBox> glyphs)
+        /// <summary>
+        /// Calculates the content height for a specific cell taking into account text wrapping and column width.
+        /// </summary>
+        /// <param name="cell">The cell to calculate content height for.</param>
+        /// <returns>The content height in pixels.</returns>
+        public static double GetContentHeight(XLCell cell)
         {
-            if (textRotationDeg == 0)
+            ExtractCellData(cell, out var glyphs, out var textRotation, out var colWidthPx, out var colHeightPx, out var spaceIndices, out var lineSpacing);
+
+            return textRotation switch
             {
-                var textHeight = 0d;
-                var lineMaxHeight = 0d;
-                foreach (var glyph in glyphs)
+                0 => CalculateHorizontalTextHeight(glyphs, colWidthPx, spaceIndices, lineSpacing),
+                255 => CalculateVerticalTextHeight(glyphs, colHeightPx, spaceIndices, lineSpacing),
+                _ => CalculateRotatedTextHeight(glyphs, textRotation)
+            };
+        }
+
+        /// <summary>
+        /// Extracts necessary data from the cell for height calculation.
+        /// </summary>
+        private static void ExtractCellData(XLCell cell, out List<GlyphBox> glyphs, out int textRotation, out int colWidthPx, out int colHeightPx, out HashSet<int> spaceIndices, out double lineSpacing)
+        {
+            var engine = cell.Worksheet.Workbook.GraphicEngine;
+            var dpi = new Dpi(cell.Worksheet.Workbook.DpiX, cell.Worksheet.Workbook.DpiY);
+            glyphs = new List<GlyphBox>();
+
+            // Get glyph boxes for the cell
+            cell.GetGlyphBoxes(engine, dpi, glyphs);
+
+            // Get text rotation from cell style
+            textRotation = cell.Style.Alignment.TextRotation;
+
+            // Get column width in pixels
+            colWidthPx = GetColumnWidthInPixels(cell, engine, dpi);
+            colHeightPx = GetColumnHeightInPixels(cell, engine, dpi);
+
+            // Calculate proper line spacing from font metrics
+            lineSpacing = CalculateLineSpacing(cell, engine, dpi);
+
+            // Pre-calculate space indices for efficient word boundary detection
+            spaceIndices = new HashSet<int>();
+            for (int i = 0; i < glyphs.Count; i++)
+            {
+                var glyph = glyphs[i];
+                // Detect spaces based on glyph properties
+                // Spaces typically have advance width roughly 1/4 to 1/3 of the line height
+                bool isSpace = glyph.AdvanceWidth > 0 &&
+                              glyph.AdvanceWidth < glyph.LineHeight * 0.4f &&
+                              glyph.AdvanceWidth >= glyph.LineHeight * 0.15f;
+                if (isSpace)
                 {
-                    if (!glyph.IsLineBreak)
+                    spaceIndices.Add(i);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Calculates the column width in pixels for the given cell.
+        /// </summary>
+        private static int GetColumnWidthInPixels(XLCell cell, IXLGraphicEngine engine, Dpi dpi)
+        {
+            // Get the column width in Excel's "Number of Characters" unit
+            var column = cell.Worksheet.Column(cell.Address.ColumnNumber);
+            var columnWidthNoC = column.Width;
+
+            // Calculate Maximum Digit Width (MDW) for conversion
+            var mdw = (int)Math.Round(engine.GetMaxDigitWidth(cell.Worksheet.Workbook.Style.Font, dpi.X));
+
+            // Convert from NoC to pixels using Excel's formula
+            var columnWidthPx = (int)Math.Ceiling(XLHelper.NoCToPixels(columnWidthNoC, mdw));
+
+            // Use a reasonable minimum width if column width is too small
+            return Math.Max(columnWidthPx, 20); // Minimum 20 pixels
+        }
+
+        /// <summary>
+        /// Calculates the column height in pixels for the given cell.
+        /// </summary>
+        private static int GetColumnHeightInPixels(XLCell cell, IXLGraphicEngine engine, Dpi dpi)
+        {
+            // Get the row height in points
+            var row = cell.WorksheetRow();
+            var rowHeightPt = row.Height;
+
+            // Convert row height from points to pixels
+            var rowHeightPx = (int)Math.Ceiling(XLHelper.PointsToPixels(rowHeightPt, dpi.Y));
+
+            // Use a reasonable minimum height if row height is too small
+            return Math.Max(rowHeightPx, 20); // Minimum 20 pixels (about 15 points)
+        }
+
+        /// <summary>
+        /// Calculates proper line spacing based on font metrics.
+        /// </summary>
+        private static double CalculateLineSpacing(XLCell cell, IXLGraphicEngine engine, Dpi dpi)
+        {
+            // Get the font's proper text height which includes line spacing
+            var fontTextHeight = engine.GetTextHeight(cell.Style.Font, dpi.Y);
+
+            // Get the actual glyph line height (EmSize + Descent)
+            var glyphLineHeight = cell.Style.Font.FontSize / 72d * dpi.Y + engine.GetDescent(cell.Style.Font, dpi.Y);
+
+            // Line spacing is the difference between font's text height and glyph line height
+            // This represents the natural spacing that should exist between lines
+            return Math.Max(0, fontTextHeight - glyphLineHeight);
+        }
+
+        /// <summary>
+        /// Calculates height for horizontal text with word wrapping support.
+        /// </summary>
+        private static double CalculateHorizontalTextHeight(List<GlyphBox> glyphs, int colWidthPx, HashSet<int> spaceIndices, double lineSpacing)
+        {
+            if (colWidthPx <= 0 || glyphs.Count == 0)
+            {
+                return CalculateFallbackHeight(glyphs, lineSpacing);
+            }
+
+            var textHeight = 0d;
+            var lineMaxHeight = 0d;
+            var currentLineWidth = 0d;
+            var currentWordWidth = 0d;
+            var currentWordGlyphCount = 0;
+            var isFirstWordOfLine = true;
+            var lineCount = 0;
+
+            for (int i = 0; i < glyphs.Count; i++)
+            {
+                var glyph = glyphs[i];
+
+                if (glyph.IsLineBreak)
+                {
+                    textHeight += lineMaxHeight;
+                    lineMaxHeight = 0d;
+                    currentLineWidth = 0d;
+                    currentWordWidth = 0d;
+                    currentWordGlyphCount = 0;
+                    isFirstWordOfLine = true;
+
+                    lineCount++;
+                    continue;
+                }
+
+                var glyphHeight = glyph.LineHeight;
+                lineMaxHeight = Math.Max(glyphHeight, lineMaxHeight);
+
+                bool isWordEnd = spaceIndices.Contains(i) || i == glyphs.Count - 1;
+
+                currentWordWidth += glyph.AdvanceWidth;
+                currentWordGlyphCount++;
+
+                if (isWordEnd)
+                {
+                    bool wasWrapped = false;
+
+                    // End of word - check if we need to wrap
+                    if (currentLineWidth + currentWordWidth > colWidthPx)
                     {
-                        var cellHeightPx = glyph.LineHeight;
-                        lineMaxHeight = Math.Max(cellHeightPx, lineMaxHeight);
+                        if (isFirstWordOfLine)
+                        {
+
+                            // First word doesn't fit - wrap on character boundary
+                            var remainingWidth = colWidthPx - currentLineWidth;
+                            if (remainingWidth > 0 && currentWordGlyphCount > 1)
+                            {
+                                // Estimate how many characters fit
+                                var avgGlyphWidth = currentWordWidth / currentWordGlyphCount;
+                                var fittingGlyphs = Math.Max(1, (int)(remainingWidth / avgGlyphWidth));
+
+                                if (fittingGlyphs < currentWordGlyphCount)
+                                {
+                                    // Split the word - start new line with remaining part
+                                    textHeight += lineMaxHeight;
+                                    lineMaxHeight = glyphHeight;
+                                    currentLineWidth = currentWordWidth - (fittingGlyphs * avgGlyphWidth);
+                                }
+                                else
+                                {
+                                    // Whole word fits
+                                    currentLineWidth += currentWordWidth;
+                                }
+                            }
+                            else
+                            {
+                                // Can't fit anything, start new line
+                                textHeight += lineMaxHeight;
+                                lineMaxHeight = glyphHeight;
+                                currentLineWidth = currentWordWidth;
+                            }
+                        }
+                        else
+                        {
+                            // Not first word - wrap on word boundary
+                            textHeight += lineMaxHeight;
+                            lineMaxHeight = glyphHeight;
+                            currentLineWidth = currentWordWidth;
+                        }
+                        isFirstWordOfLine = false;
+                        wasWrapped = true;
                     }
                     else
                     {
-                        // At the end of each line, add height of the line to total height.
-                        textHeight += lineMaxHeight;
-                        lineMaxHeight = 0d;
+                        // Word fits on current line
+                        currentLineWidth += currentWordWidth;
+                        isFirstWordOfLine = false;
                     }
-                }
 
-                // If the last line ends without EOL, it must be also counted
+                    currentWordWidth = 0d;
+                    currentWordGlyphCount = 0;
+
+                    if (wasWrapped)
+                        lineCount++;
+                }
+            }
+
+            // Add height of the final line if it has content
+            if (lineMaxHeight > 0)
+            {
                 textHeight += lineMaxHeight;
+                lineCount++;
+            }
 
-                return textHeight;
-            }
-            else if (textRotationDeg == 255)
+            // Add proper line spacing between lines based on font metrics
+            if (lineCount > 1)
             {
-                // Glyphs are vertically aligned.
-                var textHeight = glyphs.Sum(static g => g.LineHeight);
-                return textHeight;
+                textHeight += lineSpacing * (lineCount - 1); // Add spacing between lines
             }
-            else
+
+            return textHeight;
+        }
+
+        /// <summary>
+        /// Calculates the height needed for vertical text (rotation 255).
+        /// For vertical text, we wrap based on available height and accumulate glyph widths.
+        /// </summary>
+        private static double CalculateVerticalTextHeight(List<GlyphBox> glyphs, int colHeightPx, HashSet<int> spaceIndices, double lineSpacing)
+        {
+            if (!glyphs.Any())
+                return 0;
+
+            var availableHeight = colHeightPx;
+            var currentHeight = 0.0;
+            var totalWidth = 0.0;
+            var columnCount = 1;
+            var maxGlyphWidth = 0.0;
+            var currentWordHeight = 0.0;
+            var currentWordMaxWidth = 0.0;
+            var currentWordGlyphCount = 0;
+            var isFirstWordOfColumn = true;
+
+            for (int i = 0; i < glyphs.Count; i++)
             {
-                // Rotated text
-                var width = 0d;
-                var height = 0d;
-                foreach (var glyph in glyphs)
+                var glyph = glyphs[i];
+
+                // Check for explicit line breaks (\n) - for vertical text, this starts a new column
+                if (ProcessVerticalLineBreak(glyph, ref currentHeight, ref totalWidth, ref columnCount, ref maxGlyphWidth))
                 {
-                    width += glyph.AdvanceWidth;
-                    height = Math.Max(glyph.LineHeight, height);
+                    // Reset word tracking after line break
+                    currentWordHeight = 0.0;
+                    currentWordMaxWidth = 0.0;
+                    currentWordGlyphCount = 0;
+                    isFirstWordOfColumn = true;
+                    continue;
                 }
 
-                var projectedWidth = Math.Sin(XLHelper.DegToRad(textRotationDeg)) * width;
-                var projectedHeight = Math.Cos(XLHelper.DegToRad(textRotationDeg)) * height;
-                return projectedWidth + projectedHeight;
+                var glyphHeight = glyph.LineHeight;
+                var glyphWidth = glyph.AdvanceWidth;
+
+                bool isWordEnd = spaceIndices.Contains(i) || i == glyphs.Count - 1;
+
+                // Accumulate word dimensions
+                currentWordHeight += glyphHeight;
+                currentWordMaxWidth = Math.Max(currentWordMaxWidth, glyphWidth);
+                currentWordGlyphCount++;
+
+                if (isWordEnd)
+                {
+                    // End of word - check if we need to wrap to next column
+                    if (currentHeight + currentWordHeight > availableHeight && currentHeight > 0)
+                    {
+                        if (isFirstWordOfColumn)
+                        {
+                            // First word doesn't fit - split it (character-level wrapping for vertical text)
+                            var remainingHeight = availableHeight - currentHeight;
+                            if (remainingHeight > 0 && currentWordGlyphCount > 1)
+                            {
+                                // Estimate how many characters fit
+                                var avgGlyphHeight = currentWordHeight / currentWordGlyphCount;
+                                var fittingGlyphs = Math.Max(1, (int)(remainingHeight / avgGlyphHeight));
+
+                                if (fittingGlyphs < currentWordGlyphCount)
+                                {
+                                    // Split the word - start new column with remaining part
+                                    totalWidth += maxGlyphWidth;
+                                    columnCount++;
+                                    currentHeight = currentWordHeight - (fittingGlyphs * avgGlyphHeight);
+                                    maxGlyphWidth = currentWordMaxWidth;
+                                }
+                                else
+                                {
+                                    // Whole word fits
+                                    currentHeight += currentWordHeight;
+                                    maxGlyphWidth = Math.Max(maxGlyphWidth, currentWordMaxWidth);
+                                }
+                            }
+                            else
+                            {
+                                // Can't fit anything, start new column
+                                totalWidth += maxGlyphWidth;
+                                columnCount++;
+                                currentHeight = currentWordHeight;
+                                maxGlyphWidth = currentWordMaxWidth;
+                            }
+                        }
+                        else
+                        {
+                            // Not first word - wrap on word boundary
+                            totalWidth += maxGlyphWidth;
+                            columnCount++;
+                            currentHeight = currentWordHeight;
+                            maxGlyphWidth = currentWordMaxWidth;
+                        }
+                        isFirstWordOfColumn = false;
+                    }
+                    else
+                    {
+                        // Word fits in current column
+                        currentHeight += currentWordHeight;
+                        maxGlyphWidth = Math.Max(maxGlyphWidth, currentWordMaxWidth);
+                        isFirstWordOfColumn = false;
+                    }
+
+                    // Reset word tracking
+                    currentWordHeight = 0.0;
+                    currentWordMaxWidth = 0.0;
+                    currentWordGlyphCount = 0;
+                }
             }
+
+            // Add the width of the last column
+            totalWidth += maxGlyphWidth;
+
+            // Add proper spacing between columns based on font metrics
+            // For vertical text, column spacing should be proportional to line spacing
+            if (columnCount > 1)
+            {
+                totalWidth += lineSpacing * (columnCount - 1);
+            }
+
+            return totalWidth;
         }
+
+        /// <summary>
+        /// Processes line breaks for vertical text - creates a new column.
+        /// </summary>
+        private static bool ProcessVerticalLineBreak(GlyphBox glyph, ref double currentHeight, ref double totalWidth, ref int columnCount, ref double maxGlyphWidth)
+        {
+            // Check if this is a line break character (typically has very small AdvanceWidth and specific characteristics)
+            if (glyph.AdvanceWidth < glyph.LineHeight * 0.1 && glyph.EmSize > 0)
+            {
+                // Start new column
+                totalWidth += maxGlyphWidth;
+                columnCount++;
+                currentHeight = 0;
+                maxGlyphWidth = 0;
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Calculates height for rotated text.
+        /// </summary>
+        private static double CalculateRotatedTextHeight(List<GlyphBox> glyphs, int textRotation)
+        {
+            var width = 0d;
+            var height = 0d;
+            foreach (var glyph in glyphs)
+            {
+                width += glyph.AdvanceWidth;
+                height = Math.Max(glyph.LineHeight, height);
+            }
+
+            var projectedWidth = Math.Sin(XLHelper.DegToRad(textRotation)) * width;
+            var projectedHeight = Math.Cos(XLHelper.DegToRad(textRotation)) * height;
+            return projectedWidth + projectedHeight;
+        }
+
+        /// <summary>
+        /// Calculates fallback height when column width is not available.
+        /// </summary>
+        private static double CalculateFallbackHeight(List<GlyphBox> glyphs, double lineSpacing)
+        {
+            var fallbackHeight = 0d;
+            var fallbackLineMaxHeight = 0d;
+            var lineCount = 0;
+
+            foreach (var glyph in glyphs)
+            {
+                if (!glyph.IsLineBreak)
+                {
+                    var cellHeightPx = glyph.LineHeight;
+                    fallbackLineMaxHeight = Math.Max(cellHeightPx, fallbackLineMaxHeight);
+                }
+                else
+                {
+                    fallbackHeight += fallbackLineMaxHeight;
+                    fallbackLineMaxHeight = 0d;
+                    lineCount++;
+                }
+            }
+
+            if (fallbackLineMaxHeight > 0)
+            {
+                fallbackHeight += fallbackLineMaxHeight;
+                lineCount++;
+            }
+
+            // Add proper line spacing for fallback calculation based on font metrics
+            if (lineCount > 1)
+            {
+                fallbackHeight += lineSpacing * (lineCount - 1);
+            }
+
+            return fallbackHeight;
+        }
+
+
 
         public IXLRow Hide()
         {
@@ -670,6 +1042,7 @@ namespace ClosedXML.Excel
         {
             return false;
         }
+
 
         /// <summary>
         /// Flag enum to save space, instead of wasting byte for each flag.
